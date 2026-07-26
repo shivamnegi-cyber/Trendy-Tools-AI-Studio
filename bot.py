@@ -305,9 +305,9 @@ def download_image(url, out="raw.jpg"):
     return out
 
 
-def safe_download(url):
+def safe_download(url, out="raw.jpg"):
     try:
-        return download_image(url)
+        return download_image(url, out)
     except Exception as e:
         print(f"[warn] download: {e}")
         return None
