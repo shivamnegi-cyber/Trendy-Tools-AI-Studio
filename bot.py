@@ -23,7 +23,8 @@ import requests
 # ---------------------------------------------------------------------------
 # CONFIG - all values come from GitHub Secrets (never hard-code keys here)
 # ---------------------------------------------------------------------------
-OPENROUTER_KEY   = os.environ["OPENROUTER_KEY"]
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")   # primary text brain
+OPENROUTER_KEY   = os.environ.get("OPENROUTER_KEY", "")   # backup text brain
 CF_ACCOUNT_ID    = os.environ["CF_ACCOUNT_ID"]
 CF_API_TOKEN     = os.environ["CF_API_TOKEN"]
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -34,42 +35,82 @@ AMAZON_TAG       = os.environ.get("AMAZON_TAG", "dailyneedss03-21")
 PIN_ACCESS_TOKEN = os.environ.get("PIN_ACCESS_TOKEN", "")
 PIN_BOARD_ID     = os.environ.get("PIN_BOARD_ID", "")
 
-# A few known-good manual fallbacks (tried only if the live lookup returns none)
-FALLBACK_MODELS = [
+# OpenRouter backup models (only used if Gemini is unavailable)
+OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "mistralai/mistral-small-3.2-24b-instruct:free",
     "google/gemma-3-27b-it:free",
 ]
 
-
-def fetch_free_models():
-    """Ask OpenRouter which models are actually free RIGHT NOW.
-    Returns a list of model IDs whose prompt+completion price is 0.
-    This makes the bot self-healing: it never breaks when models get renamed."""
-    try:
-        r = requests.get("https://openrouter.ai/api/v1/models", timeout=30)
-        r.raise_for_status()
-        models = r.json()["data"]
-        free = []
-        for m in models:
-            p = m.get("pricing", {})
-            if p.get("prompt") == "0" and p.get("completion") == "0":
-                ctx = m.get("context_length") or 0
-                free.append((ctx, m["id"]))
-        # biggest context first, cap at 8 to try
-        free.sort(reverse=True)
-        ids = [mid for _, mid in free][:8]
-        print(f"[info] found {len(ids)} live free models")
-        return ids or FALLBACK_MODELS
-    except Exception as e:
-        print(f"[warn] could not fetch model list ({e}); using fallbacks")
-        return FALLBACK_MODELS
+# Gemini free models to try, in order
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 # The niche/vibe for Trendy Tools Hub
 NICHE = (
     "trendy, useful daily-use products, smart gadgets and lifestyle tools "
     "available on Amazon India that save time and money for everyday people"
 )
+
+
+# ---------------------------------------------------------------------------
+# TEXT BRAIN - tries Gemini first, then OpenRouter. Returns raw text.
+# ---------------------------------------------------------------------------
+def gemini_complete(prompt):
+    for model in GEMINI_MODELS:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                params={"key": GEMINI_API_KEY},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=60,
+            )
+            if r.status_code != 200:
+                print(f"[debug] gemini {model} -> HTTP {r.status_code}: {r.text[:300]}")
+                continue
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            print(f"[ok] text via Gemini {model}")
+            return text
+        except Exception as e:
+            print(f"[warn] gemini {model} failed: {e}")
+    return None
+
+
+def openrouter_complete(prompt):
+    for model in OPENROUTER_MODELS:
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.9,
+                },
+                timeout=60,
+            )
+            if r.status_code != 200:
+                print(f"[debug] openrouter {model} -> HTTP {r.status_code}: {r.text[:300]}")
+                continue
+            print(f"[ok] text via OpenRouter {model}")
+            return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"[warn] openrouter {model} failed: {e}")
+    return None
+
+
+def get_text(prompt):
+    """Gemini first (stable, 1500/day free), OpenRouter as backup."""
+    text = None
+    if GEMINI_API_KEY:
+        text = gemini_complete(prompt)
+    if text is None and OPENROUTER_KEY:
+        text = openrouter_complete(prompt)
+    if text is None:
+        raise RuntimeError("All text providers failed - check keys and logs above")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -89,39 +130,11 @@ object (no markdown, no extra text) with exactly these keys:
   "pin_description": "2-3 sentences selling the product with an emotional hook, then a clear call to action like 'Tap the link to grab yours', ending with 5-7 relevant hashtags",
   "image_prompt": "a detailed prompt to generate a clean, bright, professional product-hero photo of this item on a soft studio background, no text, no watermark"
 }}"""
-
-    last_error = None
-    for model in fetch_free_models():
-        try:
-            r = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://github.com/trendy-tools-bot",
-                    "X-Title": "Trendy Tools Hub",
-                },
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.9,
-                },
-                timeout=60,
-            )
-            if r.status_code != 200:
-                print(f"[debug] {model} -> HTTP {r.status_code}: {r.text[:400]}")
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            # Pull the JSON object out even if the model wrapped it in text
-            match = re.search(r"\{.*\}", content, re.DOTALL)
-            data = json.loads(match.group(0))
-            print(f"[ok] research via {model}: {data['product_name']}")
-            return data
-        except Exception as e:
-            last_error = e
-            print(f"[warn] model {model} failed: {e}")
-            continue
-    raise RuntimeError(f"All LLM models failed. Last error: {last_error}")
+    content = get_text(prompt)
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    data = json.loads(match.group(0))
+    print(f"[ok] research complete: {data['product_name']}")
+    return data
 
 
 # ---------------------------------------------------------------------------
