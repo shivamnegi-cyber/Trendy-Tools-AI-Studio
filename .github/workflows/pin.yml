@@ -9,8 +9,6 @@ on:
 jobs:
   make-pin:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write        # lets the bot save posts.xlsx back to the repo
     steps:
       - name: Get the code
         uses: actions/checkout@v4
@@ -25,21 +23,15 @@ jobs:
 
       - name: Run the pin bot
         env:
-          GEMINI_API_KEY:   ${{ secrets.GEMINI_API_KEY }}
-          OPENROUTER_KEY:   ${{ secrets.OPENROUTER_KEY }}
-          CF_ACCOUNT_ID:    ${{ secrets.CF_ACCOUNT_ID }}
-          CF_API_TOKEN:     ${{ secrets.CF_API_TOKEN }}
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          AMAZON_TAG:       ${{ secrets.AMAZON_TAG }}
-          PIN_ACCESS_TOKEN: ${{ secrets.PIN_ACCESS_TOKEN }}
-          PIN_BOARD_ID:     ${{ secrets.PIN_BOARD_ID }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_KEY:     ${{ secrets.OPENROUTER_KEY }}
+          CF_ACCOUNT_ID:      ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN:       ${{ secrets.CF_API_TOKEN }}
+          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          AMAZON_TAG:         ${{ secrets.AMAZON_TAG }}
+          GSHEET_ID:          ${{ secrets.GSHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          PIN_ACCESS_TOKEN:   ${{ secrets.PIN_ACCESS_TOKEN }}
+          PIN_BOARD_ID:       ${{ secrets.PIN_BOARD_ID }}
         run: python bot.py
-
-      - name: Save the post log (posts.xlsx) back to the repo
-        run: |
-          git config user.name "pin-bot"
-          git config user.email "pin-bot@users.noreply.github.com"
-          git add posts.xlsx
-          git commit -m "Log new pin ($(date +%F))" || echo "nothing to commit"
-          git push
