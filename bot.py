@@ -34,13 +34,36 @@ AMAZON_TAG       = os.environ.get("AMAZON_TAG", "dailyneedss03-21")
 PIN_ACCESS_TOKEN = os.environ.get("PIN_ACCESS_TOKEN", "")
 PIN_BOARD_ID     = os.environ.get("PIN_BOARD_ID", "")
 
-# Free LLM models on OpenRouter. Bot tries them top-to-bottom until one works,
-# so it never stops if one is rate-limited.
-LLM_MODELS = [
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-       "tencent/hy3:free",
-       "poolside/laguna-m.1:free",
+# A few known-good manual fallbacks (tried only if the live lookup returns none)
+FALLBACK_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-small-3.2-24b-instruct:free",
+    "google/gemma-3-27b-it:free",
 ]
+
+
+def fetch_free_models():
+    """Ask OpenRouter which models are actually free RIGHT NOW.
+    Returns a list of model IDs whose prompt+completion price is 0.
+    This makes the bot self-healing: it never breaks when models get renamed."""
+    try:
+        r = requests.get("https://openrouter.ai/api/v1/models", timeout=30)
+        r.raise_for_status()
+        models = r.json()["data"]
+        free = []
+        for m in models:
+            p = m.get("pricing", {})
+            if p.get("prompt") == "0" and p.get("completion") == "0":
+                ctx = m.get("context_length") or 0
+                free.append((ctx, m["id"]))
+        # biggest context first, cap at 8 to try
+        free.sort(reverse=True)
+        ids = [mid for _, mid in free][:8]
+        print(f"[info] found {len(ids)} live free models")
+        return ids or FALLBACK_MODELS
+    except Exception as e:
+        print(f"[warn] could not fetch model list ({e}); using fallbacks")
+        return FALLBACK_MODELS
 
 # The niche/vibe for Trendy Tools Hub
 NICHE = (
@@ -68,13 +91,15 @@ object (no markdown, no extra text) with exactly these keys:
 }}"""
 
     last_error = None
-    for model in LLM_MODELS:
+    for model in fetch_free_models():
         try:
             r = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_KEY}",
                     "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/trendy-tools-bot",
+                    "X-Title": "Trendy Tools Hub",
                 },
                 json={
                     "model": model,
@@ -83,6 +108,8 @@ object (no markdown, no extra text) with exactly these keys:
                 },
                 timeout=60,
             )
+            if r.status_code != 200:
+                print(f"[debug] {model} -> HTTP {r.status_code}: {r.text[:400]}")
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
             # Pull the JSON object out even if the model wrapped it in text
