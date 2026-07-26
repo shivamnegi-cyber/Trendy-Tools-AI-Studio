@@ -37,9 +37,9 @@ PIN_BOARD_ID     = os.environ.get("PIN_BOARD_ID", "")
 # Free LLM models on OpenRouter. Bot tries them top-to-bottom until one works,
 # so it never stops if one is rate-limited.
 LLM_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "qwen/qwen3-235b-a22b:free",
-    "google/gemma-3-27b-it:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+       "tencent/hy3:free",
+       "poolside/laguna-m.1:free",
 ]
 
 # The niche/vibe for Trendy Tools Hub
