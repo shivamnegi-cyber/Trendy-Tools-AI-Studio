@@ -9,6 +9,8 @@ on:
 jobs:
   make-pin:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # lets the bot save posts.xlsx back to the repo
     steps:
       - name: Get the code
         uses: actions/checkout@v4
@@ -33,3 +35,11 @@ jobs:
           PIN_ACCESS_TOKEN: ${{ secrets.PIN_ACCESS_TOKEN }}
           PIN_BOARD_ID:     ${{ secrets.PIN_BOARD_ID }}
         run: python bot.py
+
+      - name: Save the post log (posts.xlsx) back to the repo
+        run: |
+          git config user.name "pin-bot"
+          git config user.email "pin-bot@users.noreply.github.com"
+          git add posts.xlsx
+          git commit -m "Log new pin ($(date +%F))" || echo "nothing to commit"
+          git push
