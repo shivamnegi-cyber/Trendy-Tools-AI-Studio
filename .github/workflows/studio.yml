@@ -1,1 +1,40 @@
+name: Trendy Tools - AI Studio (always-on)
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"   # safety restart every 30 min; concurrency keeps ONE alive
+
+# Only one studio shift runs at a time; the next queued run takes over seamlessly
+# when a shift ends (so /new is always answered).
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: false
+
+jobs:
+  studio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340          # each shift ~5.3h; well under GitHub's 6h cap
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg (for Idea-Pin video)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install -r requirements.txt
+      - name: Run the always-on studio
+        env:
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY:       ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_KEY:     ${{ secrets.OPENROUTER_KEY }}
+          CF_ACCOUNT_ID:      ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN:       ${{ secrets.CF_API_TOKEN }}
+          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          AMAZON_TAG:         ${{ secrets.AMAZON_TAG }}
+          GSHEET_ID:          ${{ secrets.GSHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          PIN_ACCESS_TOKEN:   ${{ secrets.PIN_ACCESS_TOKEN }}
+          PIN_BOARD_ID:       ${{ secrets.PIN_BOARD_ID }}
+        run: python bot.py run
