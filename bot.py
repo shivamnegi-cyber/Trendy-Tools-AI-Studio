@@ -317,18 +317,19 @@ def generate_image(image_prompt, out="raw.jpg"):
     url = (f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
            f"/ai/run/@cf/black-forest-labs/flux-1-schnell")
     clean = re.sub(r"\s+", " ", image_prompt).strip()
-    REAL = (" Hyper-realistic, ultra-detailed 4k commercial product photograph, "
-            "shot on a DSLR 85mm lens, clean white studio background, soft natural "
-            "lighting, true-to-life colours, realistic materials, subtle shadow, "
-            "e-commerce catalog style, no text, no watermark, no logo, "
-            "not a cartoon, not an illustration.")
-    for attempt in (clean[:1100] + REAL, clean[:220] + REAL):
+    REAL = (" Award-winning professional commercial product photography, "
+            "hyper-realistic, ultra-detailed, 8k, shot on a Canon EOS R5 with an "
+            "85mm f/1.8 lens, studio softbox lighting with a gentle reflection, "
+            "true-to-life colours and textures, crisp focus, clean composition, "
+            "photorealistic, magazine-quality, no text, no watermark, no logo, "
+            "no packaging clutter, not a cartoon, not an illustration, no deformities.")
+    for attempt in (clean[:1000] + REAL, clean[:200] + REAL):
         r = requests.post(url, headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
-                          json={"prompt": attempt, "steps": 6}, timeout=120)
+                          json={"prompt": attempt, "steps": 8}, timeout=120)
         if r.status_code == 200:
             with open(out, "wb") as f:
                 f.write(base64.b64decode(r.json()["result"]["image"]))
-            print("[ok] hyper-real AI image generated")
+            print("[ok] professional AI image generated")
             return out
         print(f"[debug] cloudflare {r.status_code}: {r.text[:150]}")
     r.raise_for_status()
@@ -357,20 +358,81 @@ def format_pinterest(path, badge="Best Seller", out="pin_final.jpg"):
     im.thumbnail((940, 1380))
     canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2))
     draw = ImageDraw.Draw(canvas)
-    # small tasteful pill badge, top-left (no big title text)
-    bf = load_font(30)
-    txt = f"★ {badge}"
-    tw = draw.textlength(txt, font=bf)
-    draw.rounded_rectangle([28, 28, 28 + tw + 34, 84], radius=26, fill=(17, 17, 17))
-    draw.text((45, 40), txt, fill=(255, 255, 255), font=bf)
-    # subtle brand mark, bottom-right
-    sf = load_font(24)
+    if badge:                                   # small tasteful pill (cover only)
+        bf = load_font(30)
+        txt = f"★ {badge}"
+        tw = draw.textlength(txt, font=bf)
+        draw.rounded_rectangle([28, 28, 28 + tw + 34, 84], radius=26, fill=(17, 17, 17))
+        draw.text((45, 40), txt, fill=(255, 255, 255), font=bf)
+    sf = load_font(24)                          # subtle brand mark
     brand = "Trendy Tools Hub"
     draw.text((W - draw.textlength(brand, font=sf) - 28, H - 42), brand,
               fill=(165, 165, 165), font=sf)
     canvas.save(out, quality=92)
     print("[ok] clean 2:3 pin formatted")
     return out
+
+
+def make_slideshow(images, out="pin_video.mp4"):
+    """Build a smooth Ken-Burns slideshow video from multiple images (ffmpeg)."""
+    if not images:
+        return None
+    try:
+        clips = []
+        for i, img in enumerate(images):
+            c = f"clip{i}.mp4"
+            subprocess.run(
+                ["ffmpeg", "-y", "-loop", "1", "-i", img, "-t", "2.6",
+                 "-vf", ("scale=1000:1500,zoompan=z='min(zoom+0.0015,1.12)':"
+                         "d=65:s=1000x1500:fps=25"),
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25", c],
+                check=True, capture_output=True, timeout=120)
+            clips.append(c)
+        with open("concat.txt", "w") as f:
+            for c in clips:
+                f.write(f"file '{c}'\n")
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                        "-i", "concat.txt", "-c", "copy", out],
+                       check=True, capture_output=True, timeout=120)
+        print(f"[ok] slideshow video ({len(images)} frames)")
+        return out
+    except Exception as e:
+        print(f"[warn] slideshow: {e}")
+        return None
+
+
+def tg_send_media_group(paths, caption=""):
+    """Send several images as one Telegram album."""
+    media, files = [], {}
+    for i, p in enumerate(paths[:10]):
+        key = f"photo{i}"
+        item = {"type": "photo", "media": f"attach://{key}"}
+        if i == 0 and caption:
+            item.update({"caption": caption[:1024], "parse_mode": "HTML"})
+        media.append(item)
+        files[key] = open(p, "rb")
+    try:
+        return requests.post(f"{TG}/sendMediaGroup",
+                             data={"chat_id": TELEGRAM_CHAT_ID, "media": json.dumps(media)},
+                             files=files, timeout=120)
+    finally:
+        for f in files.values():
+            f.close()
+
+
+def upload_catbox(path):
+    """Upload an image to catbox.moe (free, no key) to get a public URL for
+    Pinterest carousel posting. Returns the URL or None."""
+    try:
+        with open(path, "rb") as f:
+            r = requests.post("https://catbox.moe/user/api.php",
+                              data={"reqtype": "fileupload"},
+                              files={"fileToUpload": f}, timeout=90)
+        if r.status_code == 200 and r.text.startswith("http"):
+            return r.text.strip()
+    except Exception as e:
+        print(f"[warn] catbox upload: {e}")
+    return None
 
 
 def make_video(image_path, out="pin_video.mp4"):
@@ -432,22 +494,69 @@ def log_post(ws, data, link, posted_to, source, fmt, status):
 # ===========================================================================
 # PINTEREST
 # ===========================================================================
-def post_to_pinterest(image_path, title, description, link):
+def _pin_headers():
+    return {"Authorization": f"Bearer {PIN_ACCESS_TOKEN}"}
+
+
+def post_video_pin(video_path, title, description, link):
+    """Register + upload a video to Pinterest, then create a video pin."""
+    reg = requests.post("https://api.pinterest.com/v5/media", headers=_pin_headers(),
+                        json={"media_type": "video"}, timeout=60)
+    reg.raise_for_status()
+    reg = reg.json()
+    up = reg["upload_url"]; params = reg["upload_parameters"]; mid = reg["media_id"]
+    with open(video_path, "rb") as f:
+        requests.post(up, data=params, files={"file": f}, timeout=180).raise_for_status()
+    for _ in range(20):                       # wait for Pinterest to process
+        time.sleep(6)
+        st = requests.get(f"https://api.pinterest.com/v5/media/{mid}",
+                          headers=_pin_headers(), timeout=30).json()
+        if st.get("status") == "succeeded":
+            break
+    # video pins need a cover image; reuse the first pin image
+    with open("pin0.jpg", "rb") as f:
+        cover = base64.b64encode(f.read()).decode()
+    r = requests.post("https://api.pinterest.com/v5/pins", headers=_pin_headers(),
+                      json={"board_id": PIN_BOARD_ID, "title": title[:100],
+                            "description": description[:800], "link": link,
+                            "media_source": {"source_type": "video_id",
+                                             "media_id": mid, "cover_image_content_type":
+                                             "image/jpeg", "cover_image_data": cover}},
+                      timeout=60)
+    r.raise_for_status()
+    print("[ok] video pin posted")
+
+
+def post_to_pinterest(images, title, description, link, video=None):
+    """Post a carousel of images as one pin, plus the video as its own pin."""
     if not (PIN_ACCESS_TOKEN and PIN_BOARD_ID):
         print("[skip] Pinterest write not set - semi-auto")
         return False
-    with open(image_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    r = requests.post("https://api.pinterest.com/v5/pins",
-                      headers={"Authorization": f"Bearer {PIN_ACCESS_TOKEN}"},
-                      json={"board_id": PIN_BOARD_ID, "title": title[:100],
-                            "description": description[:800], "link": link,
-                            "media_source": {"source_type": "image_base64",
-                                             "content_type": "image/jpeg", "data": b64}},
-                      timeout=60)
-    r.raise_for_status()
-    print("[ok] posted to Pinterest")
-    return True
+    urls = []
+    for p in images[:5]:
+        u = upload_catbox(p)
+        if u:
+            urls.append(u)
+    ok = False
+    if urls:
+        if len(urls) > 1:
+            media = {"source_type": "multiple_image_urls",
+                     "items": [{"url": u} for u in urls]}
+        else:
+            media = {"source_type": "image_url", "url": urls[0]}
+        r = requests.post("https://api.pinterest.com/v5/pins", headers=_pin_headers(),
+                          json={"board_id": PIN_BOARD_ID, "title": title[:100],
+                                "description": description[:800], "link": link,
+                                "media_source": media}, timeout=60)
+        r.raise_for_status()
+        print(f"[ok] posted carousel pin ({len(urls)} images)")
+        ok = True
+    if video:
+        try:
+            post_video_pin(video, title, description, link)
+        except Exception as e:
+            print(f"[warn] video pin failed: {e}")
+    return ok
 
 
 # ===========================================================================
@@ -531,30 +640,56 @@ Reply ONLY JSON: {{"pin_title":"...","pin_description":"..."}}"""
 
 
 class ArtDirector:
-    """Sources a clean, hyper-real image and an Idea-Pin video."""
+    """Produces a professional SET of images (studio + lifestyle + detail)
+    plus a slideshow video."""
+    SCENES = [
+        ("Professional e-commerce studio product shot on a seamless pure white "
+         "background, centered, soft even softbox lighting, gentle reflection, "
+         "ultra sharp, premium catalog look"),
+        ("Realistic lifestyle photo of the product in use in a bright, tidy modern "
+         "Indian home, natural window light, tasteful decor, shallow depth of field, "
+         "editorial magazine quality, authentic daily-use scene"),
+        ("Elegant close-up highlighting the premium materials, finish and fine "
+         "details of the product, soft directional light, high-end commercial macro "
+         "photography"),
+    ]
+
     def create(self, data):
         kw = data["search_keyword"]
         link = self._bestseller_link(kw)
-        source, raw = "AI (hyper-real)", None
+        base = data.get("image_prompt") or data["product_name"]
+        source = "AI (professional)"
+        images = []
+
+        # Cover: real product photo if we can get one, else a studio AI shot
+        cover = None
         a_url, a_link = try_amazon_product(kw)
         if a_url:
-            raw = safe_download(a_url)
-            if raw:
+            cover = safe_download(a_url, "raw0.jpg")
+            if cover:
                 link, source = a_link, "Amazon (real)"
-        if raw is None:
+        if cover is None:
             w = try_web_image(kw)
             if w:
-                raw = safe_download(w)
-                if raw:
+                cover = safe_download(w, "raw0.jpg")
+                if cover:
                     source = "Web (real)"
-        if raw is None:
-            raw = generate_image(data["image_prompt"])
-        img = format_pinterest(raw, badge="Best Seller")
-        print(f"[ArtDirector] image ready ({source})")
-        return img, link, source
+        if cover is None:
+            cover = generate_image(base + ". " + self.SCENES[0], "raw0.jpg")
+        images.append(format_pinterest(cover, badge="Best Seller", out="pin0.jpg"))
 
-    def video(self, img):
-        return make_video(img)
+        # Extra professional AI scenes (lifestyle + detail), no badge
+        for i, scene in enumerate(self.SCENES[1:], start=1):
+            try:
+                r = generate_image(base + ". " + scene, f"raw{i}.jpg")
+                images.append(format_pinterest(r, badge=None, out=f"pin{i}.jpg"))
+            except Exception as e:
+                print(f"[warn] scene {i} failed: {e}")
+        print(f"[ArtDirector] {len(images)} images ready ({source})")
+        return images, link, source
+
+    def video(self, images):
+        return make_slideshow(images)
 
     @staticmethod
     def _bestseller_link(keyword):
@@ -578,11 +713,15 @@ class Publisher:
                     return msg["text"].strip()
         return None
 
-    def approval(self, cw, data, img, link, source, video, off):
+    def _send_draft(self, images, data, link, video):
         hint = "\n\n👆 Approve &amp; Post, Reject, or ask me to Fix the copy/image."
-        tg_send_photo(img, self._caption(data, link) + hint, APPROVAL_KB)
+        tg_send_media_group(images, self._caption(data, link) + hint)
         if video:
-            tg_send_video(video, "🎬 Idea-Pin video version")
+            tg_send_video(video, "🎬 Slideshow video (posts as its own pin)")
+        tg_send_message("👆 Choose an action for this pin:", APPROVAL_KB)
+
+    def approval(self, cw, art, data, images, link, source, video, off):
+        self._send_draft(images, data, link, video)
         end = time.time() + APPROVAL_WINDOW
         while time.time() < end:
             for u in tg_get_updates(off[0], timeout=25):
@@ -593,11 +732,11 @@ class Publisher:
                 action = cb.get("data", "")
                 tg_answer_callback(cb["id"])
                 if action == "approve":
-                    return "approved", data, img, link, source
+                    return "approved", data, images, link, source, video
                 if action == "reject":
-                    return "rejected", data, img, link, source
+                    return "rejected", data, images, link, source, video
                 if action in ("fix_copy", "fix_image"):
-                    what = "the copy" if action == "fix_copy" else "the image"
+                    what = "the copy" if action == "fix_copy" else "the images"
                     tg_send_message(f"✍️ What should I improve about {what}? Reply once.")
                     note = self._wait_text(off, NOTE_WINDOW)
                     if note:
@@ -605,19 +744,17 @@ class Publisher:
                             if action == "fix_copy":
                                 data = cw.revise(data, note)
                             else:
-                                img = format_pinterest(
-                                    generate_image(data["image_prompt"] + ". " + note))
-                                source = "AI (hyper-real)"
-                                video = make_video(img)
+                                data["image_prompt"] = (data.get("image_prompt", "")
+                                                        + ". " + note)
+                                images, link, source = art.create(data)
+                                video = art.video(images)
                         except Exception as e:
                             tg_send_message(f"⚠️ Regenerate failed ({e}); keeping current.")
-                    tg_send_photo(img, self._caption(data, link) + hint, APPROVAL_KB)
-                    if video:
-                        tg_send_video(video, "🎬 Updated Idea-Pin video")
+                    self._send_draft(images, data, link, video)
                     end = time.time() + APPROVAL_WINDOW
-        return "timeout", data, img, link, source
+        return "timeout", data, images, link, source, video
 
-    def finalize(self, result, ws, data, img, link, source, fmt):
+    def finalize(self, result, ws, data, images, link, source, video, fmt):
         post, status = False, ""
         if result == "approved":
             post, status = True, "Approved"
@@ -630,11 +767,12 @@ class Publisher:
         posted_to = "Telegram (semi-auto)"
         if post:
             try:
-                if post_to_pinterest(img, data["pin_title"], data["pin_description"], link):
+                if post_to_pinterest(images, data["pin_title"],
+                                     data["pin_description"], link, video):
                     posted_to = "Pinterest"
-                    tg_send_message("✅ Posted to Pinterest!")
+                    tg_send_message("✅ Posted to Pinterest (carousel + video)!")
                 else:
-                    tg_send_message("✅ Approved. Post it from the image above until "
+                    tg_send_message("✅ Approved. Post it from the images above until "
                                     "Pinterest write access is live - then it auto-posts.")
             except Exception as e:
                 tg_send_message(f"⚠️ Pinterest post failed ({e}).")
@@ -705,12 +843,12 @@ class Manager:
         signals = self.trend.research(category)
         data = self.strategist.choose(signals, recent, category, season)
         data = self.copywriter.write(data)
-        img, link, source = self.art.create(data)
-        video = self.art.video(img)
-        fmt = "Image + Video" if video else "Image"
-        result, data, img, link, source = self.publisher.approval(
-            self.copywriter, data, img, link, source, video, off)
-        self.publisher.finalize(result, ws, data, img, link, source, fmt)
+        images, link, source = self.art.create(data)
+        video = self.art.video(images)
+        fmt = f"{len(images)} images" + (" + video" if video else "")
+        result, data, images, link, source, video = self.publisher.approval(
+            self.copywriter, self.art, data, images, link, source, video, off)
+        self.publisher.finalize(result, ws, data, images, link, source, video, fmt)
         print(f"[Manager] {mode} cycle done ({result})")
 
     def _done_today(self, today):
