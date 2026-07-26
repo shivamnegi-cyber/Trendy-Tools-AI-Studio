@@ -20,9 +20,16 @@ import base64
 import datetime
 import urllib.parse
 import requests
-from openpyxl import Workbook, load_workbook
+import gspread
+from google.oauth2.service_account import Credentials
 
-HISTORY_FILE = "posts.xlsx"   # grows one row per pin, committed back to the repo
+# Google Sheet log settings
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # service-account JSON
+GSHEET_ID  = os.environ.get("GSHEET_ID", "")                   # your sheet's ID
+GSHEET_TAB = "Pinterest"                                        # the tab it writes to
+SHEET_HEADERS = ["Date", "Time", "Product", "Search Keyword", "Pin Title",
+                 "Pin Description", "Hashtags", "Image Source", "Affiliate Link",
+                 "Posted To", "Status"]
 
 # ---------------------------------------------------------------------------
 # CONFIG - all values come from GitHub Secrets (never hard-code keys here)
@@ -350,48 +357,58 @@ def post_to_pinterest(image_path, title, description, link):
 
 
 # ---------------------------------------------------------------------------
-# 7.  EXCEL LOG - remembers every past product (so it never repeats) and
-#     keeps a running spreadsheet of all posts.
+# 7.  GOOGLE SHEET LOG - writes to the "Pinterest" tab of your master sheet,
+#     and reads past products so it never repeats one.
 # ---------------------------------------------------------------------------
-HEADERS = ["Date", "Product", "Search Keyword", "Pin Title",
-           "Pin Description", "Affiliate Link", "Posted To"]
+def get_worksheet():
+    """Authorize as the service account and return the 'Pinterest' worksheet,
+    creating it (with headers) if it doesn't exist yet."""
+    creds = Credentials.from_service_account_info(
+        json.loads(GOOGLE_CREDENTIALS),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(GSHEET_ID)
+    try:
+        ws = sh.worksheet(GSHEET_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=GSHEET_TAB, rows=2000, cols=len(SHEET_HEADERS))
+    if not ws.get_all_values():           # empty tab -> add header row
+        ws.append_row(SHEET_HEADERS)
+    return ws
 
 
-def load_history():
-    """Return (list_of_past_product_names, workbook, worksheet)."""
-    if os.path.exists(HISTORY_FILE):
-        wb = load_workbook(HISTORY_FILE)
-        ws = wb.active
-        names = [row[1] for row in ws.iter_rows(min_row=2, values_only=True) if row[1]]
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Posts"
-        ws.append(HEADERS)
-        names = []
-    # only need the most recent 40 to keep the prompt short
-    return names[-40:], wb, ws
+def load_history(ws):
+    """Return the most recent 40 product names already in the sheet."""
+    products = ws.col_values(3)[1:]       # column 3 = Product, skip header
+    return [p for p in products if p][-40:]
 
 
-def log_post(wb, ws, data, link, posted_to):
-    ws.append([
-        datetime.date.today().isoformat(),
+def log_post(ws, data, link, posted_to, image_source, status="Success"):
+    now = datetime.datetime.now()
+    hashtags = " ".join(re.findall(r"#\w+", data.get("pin_description", "")))
+    ws.append_row([
+        now.strftime("%Y-%m-%d"),
+        now.strftime("%H:%M"),
         data["product_name"],
         data["search_keyword"],
         data["pin_title"],
         data["pin_description"],
+        hashtags,
+        image_source,
         link,
         posted_to,
-    ])
-    wb.save(HISTORY_FILE)
-    print(f"[ok] logged to {HISTORY_FILE}")
+        status,
+    ], value_input_option="USER_ENTERED")
+    print("[ok] logged to Google Sheet")
 
 
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 def main():
-    recent, wb, ws = load_history()
+    ws = get_worksheet()
+    recent = load_history(ws)
     data = research_and_write(recent)
 
     # IMAGE PRIORITY:
@@ -401,17 +418,21 @@ def main():
     kw = data["search_keyword"]
     link = affiliate_link(kw)          # default: Amazon search link
     img = None
+    image_source = "AI (authentic)"
 
     a_url, a_link = try_amazon_product(kw)
     if a_url:
         img = safe_download(a_url)
         if img:
             link = a_link              # upgrade to exact product link
+            image_source = "Amazon (real)"
 
     if img is None:
         w_url = try_web_image(kw)
         if w_url:
             img = safe_download(w_url)
+            if img:
+                image_source = "Web (real)"
 
     if img is None:
         img = generate_image(data["image_prompt"])
@@ -425,7 +446,7 @@ def main():
     else:
         print("[skip] Pinterest not configured yet - staying in semi-auto mode")
 
-    log_post(wb, ws, data, link, posted_to)
+    log_post(ws, data, link, posted_to, image_source)
     print("[done] pin cycle complete")
 
 
