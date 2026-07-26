@@ -176,18 +176,30 @@ def generate_image(image_prompt, out_path="pin.jpg"):
         f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
         f"/ai/run/@cf/black-forest-labs/flux-1-schnell"
     )
-    r = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
-        json={"prompt": image_prompt, "steps": 6},
-        timeout=120,
-    )
+    # FLUX rejects very long prompts, so clean whitespace and cap the length.
+    clean = re.sub(r"\s+", " ", image_prompt).strip()
+    # Realism modifiers so the AI image looks like a genuine product photo.
+    REALISM = (" Photorealistic commercial product photograph, shot on a DSLR "
+               "with an 85mm lens, natural soft studio lighting, sharp focus, "
+               "realistic materials and reflections, high detail, e-commerce "
+               "catalog style, no text, no watermark, no logo, not a cartoon, "
+               "not an illustration.")
+    # Try the full (capped) prompt, then a shorter version if it's refused.
+    for attempt in (clean[:1200] + REALISM, clean[:250] + REALISM):
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+            json={"prompt": attempt, "steps": 6},
+            timeout=120,
+        )
+        if r.status_code == 200:
+            b64 = r.json()["result"]["image"]
+            with open(out_path, "wb") as f:
+                f.write(base64.b64decode(b64))
+            print(f"[ok] image saved -> {out_path}")
+            return out_path
+        print(f"[debug] cloudflare HTTP {r.status_code}: {r.text[:300]}")
     r.raise_for_status()
-    b64 = r.json()["result"]["image"]
-    with open(out_path, "wb") as f:
-        f.write(base64.b64decode(b64))
-    print(f"[ok] image saved -> {out_path}")
-    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +257,47 @@ def try_amazon_product(keyword):
 def download_image(url, out_path="pin.jpg"):
     r = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=60)
     r.raise_for_status()
+    ctype = r.headers.get("Content-Type", "")
+    if "image" not in ctype or len(r.content) < 3000:
+        raise ValueError(f"not a real image (type={ctype}, {len(r.content)} bytes)")
     with open(out_path, "wb") as f:
         f.write(r.content)
-    print(f"[ok] downloaded real Amazon image -> {out_path}")
+    print(f"[ok] downloaded real image -> {out_path}")
     return out_path
+
+
+def safe_download(url):
+    """Download an image, returning the path or None (never raises)."""
+    try:
+        return download_image(url)
+    except Exception as e:
+        print(f"[warn] image download failed ({e})")
+        return None
+
+
+def try_web_image(keyword):
+    """Find a real photo of a similar product on the open web (Openverse,
+    free, no API key, commercially licensed). Returns an image URL or None."""
+    try:
+        r = requests.get(
+            "https://api.openverse.org/v1/images/",
+            params={"q": keyword, "license_type": "commercial", "page_size": 8},
+            headers={"User-Agent": BROWSER_UA},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"[info] web image search HTTP {r.status_code} -> AI image")
+            return None
+        for item in r.json().get("results", []):
+            u = item.get("url")
+            if u:
+                print("[ok] found a similar real product photo on the web")
+                return u
+        print("[info] no web image found -> AI image")
+        return None
+    except Exception as e:
+        print(f"[warn] web image search failed ({e}) -> AI image")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -345,20 +394,27 @@ def main():
     recent, wb, ws = load_history()
     data = research_and_write(recent)
 
-    # HYBRID IMAGE: try the real Amazon photo + exact product link first,
-    # fall back to the AI image + search link if Amazon blocks the server.
-    img_url, product_link = try_amazon_product(data["search_keyword"])
-    if img_url:
-        try:
-            img = download_image(img_url)
-            link = product_link
-        except Exception as e:
-            print(f"[warn] could not download Amazon image ({e}) -> AI image")
-            img = generate_image(data["image_prompt"])
-            link = affiliate_link(data["search_keyword"])
-    else:
+    # IMAGE PRIORITY:
+    #   1) exact real Amazon product photo (+ direct product link)
+    #   2) a real photo of a similar product from the open web
+    #   3) authentic-looking AI image (last resort)
+    kw = data["search_keyword"]
+    link = affiliate_link(kw)          # default: Amazon search link
+    img = None
+
+    a_url, a_link = try_amazon_product(kw)
+    if a_url:
+        img = safe_download(a_url)
+        if img:
+            link = a_link              # upgrade to exact product link
+
+    if img is None:
+        w_url = try_web_image(kw)
+        if w_url:
+            img = safe_download(w_url)
+
+    if img is None:
         img = generate_image(data["image_prompt"])
-        link = affiliate_link(data["search_keyword"])
 
     notify_telegram(img, data["pin_title"], data["pin_description"], link)
 
