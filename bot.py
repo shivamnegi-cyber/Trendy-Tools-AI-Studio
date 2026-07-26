@@ -17,8 +17,12 @@ import os
 import re
 import json
 import base64
+import datetime
 import urllib.parse
 import requests
+from openpyxl import Workbook, load_workbook
+
+HISTORY_FILE = "posts.xlsx"   # grows one row per pin, committed back to the repo
 
 # ---------------------------------------------------------------------------
 # CONFIG - all values come from GitHub Secrets (never hard-code keys here)
@@ -42,8 +46,17 @@ OPENROUTER_MODELS = [
     "google/gemma-3-27b-it:free",
 ]
 
-# Gemini free models to try, in order
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+# Gemini free models to try IN ORDER. Each model has its OWN separate daily
+# quota, so when one hits its rate limit the bot simply moves to the next one -
+# multiplying your total free capacity before it ever needs OpenRouter.
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+]
 
 # The niche/vibe for Trendy Tools Hub
 NICHE = (
@@ -64,6 +77,9 @@ def gemini_complete(prompt):
                 json={"contents": [{"parts": [{"text": prompt}]}]},
                 timeout=60,
             )
+            if r.status_code == 429:
+                print(f"[info] Gemini {model} rate-limited today -> trying next Gemini model")
+                continue
             if r.status_code != 200:
                 print(f"[debug] gemini {model} -> HTTP {r.status_code}: {r.text[:300]}")
                 continue
@@ -72,6 +88,7 @@ def gemini_complete(prompt):
             return text
         except Exception as e:
             print(f"[warn] gemini {model} failed: {e}")
+    print("[info] all Gemini models exhausted -> falling back to OpenRouter")
     return None
 
 
@@ -116,19 +133,33 @@ def get_text(prompt):
 # ---------------------------------------------------------------------------
 # 1 + 2.  RESEARCH A PRODUCT AND WRITE THE COPY (one LLM call, JSON out)
 # ---------------------------------------------------------------------------
-def research_and_write():
-    prompt = f"""You are a Pinterest affiliate marketer for an account called
-"Trendy Tools Hub" that promotes {NICHE}.
+def research_and_write(avoid_products):
+    avoid_text = ", ".join(avoid_products) if avoid_products else "none yet"
+    prompt = f"""You are BOTH a Pinterest SEO specialist and a direct-response
+marketing copywriter for an account called "Trendy Tools Hub" that promotes
+{NICHE}.
 
-Pick ONE specific trending product to feature today. Reply with ONLY a JSON
-object (no markdown, no extra text) with exactly these keys:
+Pick ONE specific, currently trending product to feature today.
+IMPORTANT: Do NOT pick any of these already-featured products:
+[{avoid_text}]
+Choose something genuinely different from that list.
+
+Follow Pinterest SEO + algorithm best practices:
+- Front-load the main keyword in the title (people search Pinterest like Google).
+- Title: benefit-driven, keyword-rich, under 95 characters.
+- Description: 2-4 sentences. Natural keywords early, one strong emotional hook,
+  and a clear call to action (e.g. "Tap the link to grab yours"). Keep it under
+  480 characters INCLUDING hashtags.
+- Use EXACTLY 2 to 4 relevant, specific hashtags (never more than 4).
+
+Reply with ONLY a JSON object (no markdown, no extra text) with these keys:
 
 {{
   "product_name": "short product name",
   "search_keyword": "the words a shopper would type into Amazon to find it",
-  "pin_title": "catchy Pinterest title under 95 characters, benefit-driven",
-  "pin_description": "2-3 sentences selling the product with an emotional hook, then a clear call to action like 'Tap the link to grab yours', ending with 5-7 relevant hashtags",
-  "image_prompt": "a detailed prompt to generate a clean, bright, professional product-hero photo of this item on a soft studio background, no text, no watermark"
+  "pin_title": "keyword-first, benefit-driven, under 95 chars",
+  "pin_description": "SEO + persuasive copy with CTA, ending in 2-4 hashtags, under 480 chars total",
+  "image_prompt": "a detailed prompt for a clean, bright, professional product-hero photo of this exact item on a soft studio background, no text, no watermark"
 }}"""
     content = get_text(prompt)
     match = re.search(r"\{.*\}", content, re.DOTALL)
@@ -165,6 +196,59 @@ def generate_image(image_prompt, out_path="pin.jpg"):
 def affiliate_link(keyword):
     q = urllib.parse.quote_plus(keyword)
     return f"https://www.amazon.in/s?k={q}&tag={AMAZON_TAG}"
+
+
+# ---------------------------------------------------------------------------
+# 4b.  HYBRID IMAGE - best-effort grab of the REAL Amazon product photo +
+#      exact product link. If Amazon blocks the server (common), return None
+#      so main() falls back to the AI image. Never crashes the run.
+# ---------------------------------------------------------------------------
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+
+
+def try_amazon_product(keyword):
+    """Return (image_url, product_link) from the first real Amazon result,
+    or (None, None) if Amazon blocks or nothing is found."""
+    try:
+        q = urllib.parse.quote_plus(keyword)
+        r = requests.get(
+            f"https://www.amazon.in/s?k={q}",
+            headers={"User-Agent": BROWSER_UA, "Accept-Language": "en-IN,en;q=0.9"},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"[info] Amazon blocked scrape (HTTP {r.status_code}) -> AI image")
+            return None, None
+        html = r.text
+        # Pair each product's ASIN with a nearby product image
+        for m in re.finditer(r'data-asin="([A-Z0-9]{10})"', html):
+            asin = m.group(1)
+            window = html[m.start():m.start() + 3000]
+            for tag in re.findall(r"<img[^>]+>", window):
+                if "s-image" in tag:
+                    src = re.search(r'src="([^"]+)"', tag)
+                    if src:
+                        # strip the size token (e.g. ._AC_UL320_.) for full-res
+                        big = re.sub(r"\._[^/]*?_\.(jpg|jpeg|png)", r".\1",
+                                     src.group(1), flags=re.I)
+                        link = f"https://www.amazon.in/dp/{asin}?tag={AMAZON_TAG}"
+                        print(f"[ok] real Amazon product found: {asin}")
+                        return big, link
+        print("[info] no product image parsed -> AI image")
+        return None, None
+    except Exception as e:
+        print(f"[warn] Amazon scrape failed ({e}) -> AI image")
+        return None, None
+
+
+def download_image(url, out_path="pin.jpg"):
+    r = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=60)
+    r.raise_for_status()
+    with open(out_path, "wb") as f:
+        f.write(r.content)
+    print(f"[ok] downloaded real Amazon image -> {out_path}")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -217,14 +301,75 @@ def post_to_pinterest(image_path, title, description, link):
 
 
 # ---------------------------------------------------------------------------
+# 7.  EXCEL LOG - remembers every past product (so it never repeats) and
+#     keeps a running spreadsheet of all posts.
+# ---------------------------------------------------------------------------
+HEADERS = ["Date", "Product", "Search Keyword", "Pin Title",
+           "Pin Description", "Affiliate Link", "Posted To"]
+
+
+def load_history():
+    """Return (list_of_past_product_names, workbook, worksheet)."""
+    if os.path.exists(HISTORY_FILE):
+        wb = load_workbook(HISTORY_FILE)
+        ws = wb.active
+        names = [row[1] for row in ws.iter_rows(min_row=2, values_only=True) if row[1]]
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Posts"
+        ws.append(HEADERS)
+        names = []
+    # only need the most recent 40 to keep the prompt short
+    return names[-40:], wb, ws
+
+
+def log_post(wb, ws, data, link, posted_to):
+    ws.append([
+        datetime.date.today().isoformat(),
+        data["product_name"],
+        data["search_keyword"],
+        data["pin_title"],
+        data["pin_description"],
+        link,
+        posted_to,
+    ])
+    wb.save(HISTORY_FILE)
+    print(f"[ok] logged to {HISTORY_FILE}")
+
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 def main():
-    data = research_and_write()
-    link = affiliate_link(data["search_keyword"])
-    img = generate_image(data["image_prompt"])
+    recent, wb, ws = load_history()
+    data = research_and_write(recent)
+
+    # HYBRID IMAGE: try the real Amazon photo + exact product link first,
+    # fall back to the AI image + search link if Amazon blocks the server.
+    img_url, product_link = try_amazon_product(data["search_keyword"])
+    if img_url:
+        try:
+            img = download_image(img_url)
+            link = product_link
+        except Exception as e:
+            print(f"[warn] could not download Amazon image ({e}) -> AI image")
+            img = generate_image(data["image_prompt"])
+            link = affiliate_link(data["search_keyword"])
+    else:
+        img = generate_image(data["image_prompt"])
+        link = affiliate_link(data["search_keyword"])
+
     notify_telegram(img, data["pin_title"], data["pin_description"], link)
-    post_to_pinterest(img, data["pin_title"], data["pin_description"], link)
+
+    posted_to = "Telegram"
+    if PIN_ACCESS_TOKEN and PIN_BOARD_ID:
+        post_to_pinterest(img, data["pin_title"], data["pin_description"], link)
+        posted_to = "Pinterest"
+    else:
+        print("[skip] Pinterest not configured yet - staying in semi-auto mode")
+
+    log_post(wb, ws, data, link, posted_to)
     print("[done] pin cycle complete")
 
 
