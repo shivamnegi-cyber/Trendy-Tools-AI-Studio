@@ -1,3 +1,5 @@
 requests
 gspread
 google-auth
+Pillow
+pytrends
