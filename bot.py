@@ -556,15 +556,16 @@ def get_worksheet():
         ws = sh.worksheet(GSHEET_TAB)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=GSHEET_TAB, rows=3000, cols=len(SHEET_HEADERS))
-    existing = ws.get_all_values()
-    if not existing:
-        ws.append_row(SHEET_HEADERS)
-    elif existing[0] != SHEET_HEADERS:                 # auto-upgrade header row
-        cells = ws.range(1, 1, 1, len(SHEET_HEADERS))
-        for c, val in zip(cells, SHEET_HEADERS):
-            c.value = val
-        ws.update_cells(cells)
-        print("[ok] sheet header upgraded")
+    try:
+        existing = ws.get_all_values()
+        if not existing:
+            ws.append_row(SHEET_HEADERS)
+        elif existing[0] != SHEET_HEADERS:             # upgrade header via values API
+            end_col = chr(ord("A") + len(SHEET_HEADERS) - 1)   # 13 cols -> 'M'
+            ws.update(range_name=f"A1:{end_col}1", values=[SHEET_HEADERS])
+            print("[ok] sheet header upgraded")
+    except Exception as e:
+        print(f"[warn] header check skipped ({e})")
     return ws
 
 
@@ -895,7 +896,11 @@ class Publisher:
                                     "Pinterest write access is live - then it auto-posts.")
             except Exception as e:
                 tg_send_message(f"⚠️ Pinterest post failed ({e}).")
-        log_post(ws, data, link, posted_to, source, fmt, status)
+        try:
+            if ws is not None:
+                log_post(ws, data, link, posted_to, source, fmt, status)
+        except Exception as e:
+            print(f"[warn] sheet log failed ({e})")
 
 
 class Analyst:
@@ -957,8 +962,12 @@ class Manager:
         drained = tg_get_updates(off[0], timeout=0)
         if drained:
             off[0] = drained[-1]["update_id"] + 1
-        ws = get_worksheet()
-        recent = load_history(ws)
+        try:
+            ws = get_worksheet()
+            recent = load_history(ws)
+        except Exception as e:
+            print(f"[warn] sheet unavailable, continuing without log ({e})")
+            ws, recent = None, []
         category, season = pick_category(), indian_season(datetime.date.today())
         signals = self.trend.research(category)
         data = self.strategist.choose(signals, recent, category, season)
