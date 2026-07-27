@@ -406,26 +406,62 @@ def safe_download(url, out="raw.jpg"):
         return None
 
 
-def generate_image(image_prompt, out="raw.jpg"):
+REAL_STYLE = (" Award-winning professional commercial product photography, "
+              "hyper-realistic, ultra-detailed, 8k, shot on a Canon EOS R5 with an "
+              "85mm f/1.8 lens, studio softbox lighting with a gentle reflection, "
+              "true-to-life colours and textures, crisp focus, clean composition, "
+              "photorealistic, magazine-quality, no text, no watermark, no logo, "
+              "not a cartoon, not an illustration, no deformities.")
+
+
+def _together_image(prompt, out):
+    """Higher-quality FLUX render via Together (free tier)."""
+    if not TOGETHER_API_KEY:
+        return None
+    try:
+        r = requests.post("https://api.together.xyz/v1/images/generations",
+                          headers={"Authorization": f"Bearer {TOGETHER_API_KEY}"},
+                          json={"model": "black-forest-labs/FLUX.1-schnell-Free",
+                                "prompt": prompt[:1000], "width": 768, "height": 1152,
+                                "steps": 4, "n": 1, "response_format": "b64_json"},
+                          timeout=120)
+        if r.status_code != 200:
+            print(f"[debug] together img {r.status_code}: {r.text[:120]}")
+            return None
+        d = r.json()["data"][0]
+        if d.get("b64_json"):
+            with open(out, "wb") as f:
+                f.write(base64.b64decode(d["b64_json"]))
+            print("[ok] Together FLUX image")
+            return out
+        if d.get("url"):
+            return download_image(d["url"], out)
+    except Exception as e:
+        print(f"[warn] together image: {e}")
+    return None
+
+
+def _cloudflare_image(prompt, out):
     url = (f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
            f"/ai/run/@cf/black-forest-labs/flux-1-schnell")
-    clean = re.sub(r"\s+", " ", image_prompt).strip()
-    REAL = (" Award-winning professional commercial product photography, "
-            "hyper-realistic, ultra-detailed, 8k, shot on a Canon EOS R5 with an "
-            "85mm f/1.8 lens, studio softbox lighting with a gentle reflection, "
-            "true-to-life colours and textures, crisp focus, clean composition, "
-            "photorealistic, magazine-quality, no text, no watermark, no logo, "
-            "no packaging clutter, not a cartoon, not an illustration, no deformities.")
-    for attempt in (clean[:1000] + REAL, clean[:200] + REAL):
+    for attempt in (prompt[:1000], prompt[:200]):
         r = requests.post(url, headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
                           json={"prompt": attempt, "steps": 8}, timeout=120)
         if r.status_code == 200:
             with open(out, "wb") as f:
                 f.write(base64.b64decode(r.json()["result"]["image"]))
-            print("[ok] professional AI image generated")
+            print("[ok] Cloudflare FLUX image")
             return out
-        print(f"[debug] cloudflare {r.status_code}: {r.text[:150]}")
+        print(f"[debug] cloudflare {r.status_code}: {r.text[:120]}")
     r.raise_for_status()
+
+
+def generate_image(image_prompt, out="raw.jpg"):
+    prompt = re.sub(r"\s+", " ", image_prompt).strip() + REAL_STYLE
+    img = _together_image(prompt, out)     # best quality first
+    if img:
+        return img
+    return _cloudflare_image(prompt, out)  # reliable backup
 
 
 # ---- Pillow: clean 2:3 with a SMALL tasteful badge (hybrid) ----------------
@@ -769,9 +805,6 @@ class ArtDirector:
         ("Realistic lifestyle photo of the product in use in a bright, tidy modern "
          "Indian home, natural window light, tasteful decor, shallow depth of field, "
          "editorial magazine quality, authentic daily-use scene"),
-        ("Elegant close-up highlighting the premium materials, finish and fine "
-         "details of the product, soft directional light, high-end commercial macro "
-         "photography"),
     ]
 
     def create(self, data):
@@ -880,7 +913,7 @@ class Publisher:
             post, status = True, "Approved"
         elif result == "rejected":
             status = "Rejected"
-            tg_send_message("❌ Rejected - not posted. Logged in your sheet.")
+            tg_send_message("❌ Rejected - not posted.")
         else:
             post, status = True, "Auto-approved (timeout)"
             tg_send_message("⏰ No reply - auto-approving.")
@@ -896,11 +929,24 @@ class Publisher:
                                     "Pinterest write access is live - then it auto-posts.")
             except Exception as e:
                 tg_send_message(f"⚠️ Pinterest post failed ({e}).")
-        try:
-            if ws is not None:
-                log_post(ws, data, link, posted_to, source, fmt, status)
-        except Exception as e:
-            print(f"[warn] sheet log failed ({e})")
+        logged = self._log(ws, data, link, posted_to, source, fmt, status)
+        tg_send_message("🗒️ Logged to your Google Sheet."
+                        if logged else
+                        "⚠️ Couldn't write to the sheet - make sure it's a native "
+                        "Google Sheet (File → Save as Google Sheets), not an Excel file.")
+
+    @staticmethod
+    def _log(ws, *args):
+        for attempt in range(2):
+            try:
+                if ws is None:
+                    ws = get_worksheet()
+                log_post(ws, *args)
+                return True
+            except Exception as e:
+                print(f"[warn] sheet log attempt {attempt + 1}: {e}")
+                ws = None
+        return False
 
 
 class Analyst:
