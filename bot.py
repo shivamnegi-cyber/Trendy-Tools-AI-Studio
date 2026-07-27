@@ -879,6 +879,9 @@ class ArtDirector:
         ("Realistic lifestyle photo of the product in use in a bright, tidy modern "
          "Indian home, natural window light, tasteful decor, shallow depth of field, "
          "editorial magazine quality, authentic daily-use scene"),
+        ("Elegant close-up highlighting the premium materials, finish and fine "
+         "details of the product, soft directional light, high-end commercial macro "
+         "photography"),
     ]
 
     def create(self, data):
@@ -886,31 +889,31 @@ class ArtDirector:
         base = data.get("image_prompt") or data["product_name"]
         images, source = [], "AI (professional)"
 
-        # 1) The exact product's OWN photos (all the SAME real item)
-        urls, link = amazon_images(kw)
+        # Cover: the real product photo if we can grab one, else a studio AI shot
+        cover, link = None, bestseller_link(kw)
+        urls, a_link = amazon_images(kw)
         if urls:
-            source = "Amazon (real)"
-            for i, u in enumerate(urls[:4]):
-                p = safe_download(u, f"raw{i}.jpg")
-                if p:
-                    images.append(format_pinterest(
-                        p, badge="Best Seller" if i == 0 else None, out=f"pin{i}.jpg"))
-
-        # 2) A real web photo of the product
-        if not images:
+            cover = safe_download(urls[0], "raw0.jpg")
+            if cover:
+                link, source = a_link, "Amazon (real)"
+        if cover is None:
             w = try_web_image(kw)
             if w:
-                p = safe_download(w, "raw0.jpg")
-                if p:
-                    images.append(format_pinterest(p, badge="Best Seller", out="pin0.jpg"))
+                cover = safe_download(w, "raw0.jpg")
+                if cover:
                     source = "Web (real)"
+        if cover is None:
+            cover = generate_image(base + ". " + self.SCENES[0], "raw0.jpg")
+        images.append(format_pinterest(cover, badge="Best Seller", out="pin0.jpg"))
 
-        # 3) ONE consistent AI image (no mismatched variants)
-        if not images:
-            p = generate_image(base + ". " + self.SCENES[0], "raw0.jpg")
-            images.append(format_pinterest(p, badge="Best Seller", out="pin0.jpg"))
-
-        print(f"[ArtDirector] {len(images)} image(s) ready ({source})")
+        # Two more professional AI scenes (lifestyle + detail), no badge
+        for i, scene in enumerate(self.SCENES[1:], start=1):
+            try:
+                r = generate_image(base + ". " + scene, f"raw{i}.jpg")
+                images.append(format_pinterest(r, badge=None, out=f"pin{i}.jpg"))
+            except Exception as e:
+                print(f"[warn] scene {i} failed: {e}")
+        print(f"[ArtDirector] {len(images)} images ready ({source})")
         return images, link, source
 
     def video(self, images):
