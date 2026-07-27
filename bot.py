@@ -44,8 +44,13 @@ except Exception:
 # CONFIG
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
-GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")     # optional 3rd brain
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_KEY   = os.environ.get("OPENROUTER_KEY", "")
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+MISTRAL_API_KEY  = os.environ.get("MISTRAL_API_KEY", "")
+SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
+TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY", "")
+NVIDIA_API_KEY   = os.environ.get("NVIDIA_API_KEY", "")
 CF_ACCOUNT_ID    = os.environ["CF_ACCOUNT_ID"]
 CF_API_TOKEN     = os.environ["CF_API_TOKEN"]
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -69,10 +74,41 @@ TG = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite",
                  "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-OPENROUTER_MODELS = ["meta-llama/llama-3.3-70b-instruct:free",
-                     "mistralai/mistral-small-3.2-24b-instruct:free",
-                     "google/gemma-3-27b-it:free"]
+
+# Every provider below is OpenAI-compatible (base_url, key, [models to try]).
+# Each agent picks its specialist first; the ROLE_ROUTING + GLOBAL_FALLBACK below
+# spread load across all 8 providers and never let a job stall.
+OAI_PROVIDERS = {
+    "groq":      ("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY,
+                  ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]),
+    "cerebras":  ("https://api.cerebras.ai/v1/chat/completions", CEREBRAS_API_KEY,
+                  ["llama-3.3-70b", "llama3.1-8b"]),
+    "mistral":   ("https://api.mistral.ai/v1/chat/completions", MISTRAL_API_KEY,
+                  ["mistral-large-latest", "mistral-small-latest"]),
+    "sambanova": ("https://api.sambanova.ai/v1/chat/completions", SAMBANOVA_API_KEY,
+                  ["Meta-Llama-3.3-70B-Instruct", "Meta-Llama-3.1-405B-Instruct"]),
+    "together":  ("https://api.together.xyz/v1/chat/completions", TOGETHER_API_KEY,
+                  ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+                   "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"]),
+    "nvidia":    ("https://integrate.api.nvidia.com/v1/chat/completions", NVIDIA_API_KEY,
+                  ["meta/llama-3.3-70b-instruct",
+                   "nvidia/llama-3.1-nemotron-70b-instruct"]),
+    "openrouter": ("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_KEY,
+                   ["meta-llama/llama-3.3-70b-instruct:free",
+                    "mistralai/mistral-small-3.2-24b-instruct:free"]),
+}
+
+# Each agent's preferred provider order (specialist first)
+ROLE_ROUTING = {
+    "researcher": ["groq", "cerebras"],
+    "strategist": ["sambanova", "cerebras", "gemini"],
+    "copywriter": ["mistral", "cerebras", "together"],
+    "editor":     ["nvidia", "gemini", "groq"],
+    "artdirector": ["cerebras", "groq"],
+    "analyst":    ["gemini", "groq"],
+}
+GLOBAL_FALLBACK = ["gemini", "groq", "cerebras", "mistral", "sambanova",
+                   "together", "nvidia", "openrouter"]
 
 NICHE = ("trendy, useful daily-use products, smart gadgets and lifestyle tools "
          "on Amazon India that save time and money for everyday people")
@@ -140,64 +176,121 @@ APPROVAL_KB = {"inline_keyboard": [
 # ===========================================================================
 # TEXT BRAIN: Gemini -> Groq -> OpenRouter
 # ===========================================================================
+# Model auto-discovery: if the hard-coded model names ever go stale, the router
+# asks each provider what models it ACTUALLY has live and tries those too.
+_MODEL_CACHE = {}
+_BAD = ("embed", "whisper", "tts", "guard", "rerank", "moderation", "bge",
+        "stable-diffusion", "flux", "dall", "-image", "vision-embed", "-asr",
+        "-ocr", "audio", "reranker", "safety")
+_GOOD = ("instruct", "llama", "mistral", "qwen", "gemma", "nemotron", "deepseek",
+         "mixtral", "command", "phi", "gpt-oss", "-it", "maverick", "scout")
+
+
+def discover_oai_models(name):
+    """Ask an OpenAI-compatible provider which chat models are live right now."""
+    if name in _MODEL_CACHE:
+        return _MODEL_CACHE[name]
+    base, key, _ = OAI_PROVIDERS[name]
+    url = base.replace("/chat/completions", "/models")
+    ids = []
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {key}"}, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            items = data.get("data", data) if isinstance(data, dict) else data
+            for it in items:
+                mid = it.get("id") if isinstance(it, dict) else None
+                if mid and not any(b in mid.lower() for b in _BAD):
+                    ids.append(mid)
+            ids.sort(key=lambda m: 0 if any(g in m.lower() for g in _GOOD) else 1)
+    except Exception as e:
+        print(f"[warn] discover {name}: {e}")
+    _MODEL_CACHE[name] = ids
+    return ids
+
+
+def _gemini_models():
+    if "gemini" in _MODEL_CACHE:
+        return _MODEL_CACHE["gemini"]
+    ids = list(GEMINI_MODELS)
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"key": GEMINI_API_KEY}, timeout=30)
+        if r.status_code == 200:
+            for mo in r.json().get("models", []):
+                if "generateContent" in mo.get("supportedGenerationMethods", []):
+                    mid = mo["name"].split("/")[-1]
+                    if ("flash" in mid or "pro" in mid) and mid not in ids:
+                        ids.append(mid)
+    except Exception as e:
+        print(f"[warn] gemini discover: {e}")
+    _MODEL_CACHE["gemini"] = ids
+    return ids
+
+
 def _gemini(prompt):
-    for m in GEMINI_MODELS:
+    for m in _gemini_models()[:8]:
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
                 params={"key": GEMINI_API_KEY},
                 json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=60)
             if r.status_code == 429:
-                print(f"[info] Gemini {m} rate-limited -> next"); continue
+                continue
             if r.status_code != 200:
-                print(f"[debug] gemini {m} {r.status_code}: {r.text[:150]}"); continue
-            print(f"[ok] text via Gemini {m}")
+                print(f"[debug] gemini {m} {r.status_code}: {r.text[:120]}"); continue
             return r.json()["candidates"][0]["content"]["parts"][0]["text"]
         except Exception as e:
             print(f"[warn] gemini {m}: {e}")
     return None
 
 
-def _groq(prompt):
-    for m in GROQ_MODELS:
+def _oai(name, prompt):
+    """Call an OpenAI-compatible provider. Tries the curated models first, then
+    every other live model it discovers - so one dead model never kills a brain."""
+    base, key, curated = OAI_PROVIDERS[name]
+    if not key:
+        return None
+    candidates = list(curated)
+    for m in discover_oai_models(name):
+        if m not in candidates:
+            candidates.append(m)
+    tried = set()
+    for m in candidates[:8]:
+        if m in tried:
+            continue
+        tried.add(m)
         try:
-            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={"model": m, "messages": [{"role": "user", "content": prompt}],
-                      "temperature": 0.9}, timeout=60)
+            r = requests.post(base, headers={"Authorization": f"Bearer {key}"},
+                              json={"model": m,
+                                    "messages": [{"role": "user", "content": prompt}],
+                                    "temperature": 0.8}, timeout=60)
             if r.status_code != 200:
-                print(f"[debug] groq {m} {r.status_code}: {r.text[:150]}"); continue
-            print(f"[ok] text via Groq {m}")
+                print(f"[debug] {name} {m} {r.status_code}: {r.text[:100]}"); continue
             return r.json()["choices"][0]["message"]["content"]
         except Exception as e:
-            print(f"[warn] groq {m}: {e}")
+            print(f"[warn] {name} {m}: {e}")
     return None
 
 
-def _openrouter(prompt):
-    for m in OPENROUTER_MODELS:
-        try:
-            r = requests.post("https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-                json={"model": m, "messages": [{"role": "user", "content": prompt}],
-                      "temperature": 0.9}, timeout=60)
-            if r.status_code != 200:
-                print(f"[debug] openrouter {m} {r.status_code}: {r.text[:150]}"); continue
-            print(f"[ok] text via OpenRouter {m}")
-            return r.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"[warn] openrouter {m}: {e}")
-    return None
+def _call_provider(name, prompt):
+    if name == "gemini":
+        return _gemini(prompt) if GEMINI_API_KEY else None
+    return _oai(name, prompt)
 
 
-def get_text(prompt):
-    for provider, key in ((_gemini, GEMINI_API_KEY), (_groq, GROQ_API_KEY),
-                          (_openrouter, OPENROUTER_KEY)):
-        if key:
-            out = provider(prompt)
-            if out:
-                return out
-    raise RuntimeError("All text providers failed - check keys/logs")
+def get_text(prompt, role="strategist"):
+    """Route to the agent's specialist provider, then fall back through all others."""
+    order = list(ROLE_ROUTING.get(role, []))
+    for p in GLOBAL_FALLBACK:
+        if p not in order:
+            order.append(p)
+    for name in order:
+        out = _call_provider(name, prompt)
+        if out:
+            print(f"[brain] {role} -> {name}")
+            return out
+    raise RuntimeError(f"All providers failed for role '{role}'")
 
 
 def parse_json(text):
@@ -590,7 +683,7 @@ is NOT any of these already-featured: [{', '.join(avoid) or 'none'}].
 
 Reply ONLY JSON:
 {{"product_name":"short name","search_keyword":"what a shopper types on Amazon India","price_band":"a realistic rounded INR price ceiling like 'under Rs.1500' or empty if unsure","image_prompt":"clean hyper-real product-hero photo prompt of this exact item on white, with its retail packaging if typical, no text","why":"one-line reason it will sell"}}"""
-        data = parse_json(get_text(prompt))
+        data = parse_json(get_text(prompt, "strategist"))
         print(f"[Strategist] chose {data['product_name']} - {data.get('why','')}")
         return data
 
@@ -618,7 +711,7 @@ DESCRIPTION - under 480 chars total:
 - Finish with EXACTLY 2-4 relevant hashtags (never more than 4).
 
 Reply ONLY JSON: {{"pin_title":"...","pin_description":"..."}}"""
-        upd = parse_json(get_text(prompt))
+        upd = parse_json(get_text(prompt, "copywriter"))
         data["pin_title"] = upd.get("pin_title", data["product_name"])
         data["pin_description"] = upd.get("pin_description", "")
         print("[Copywriter] copy ready")
@@ -633,9 +726,35 @@ Current title: {data['pin_title']}
 Current description: {data['pin_description']}
 Feedback: {note}
 Reply ONLY JSON: {{"pin_title":"...","pin_description":"..."}}"""
-        upd = parse_json(get_text(prompt))
+        upd = parse_json(get_text(prompt, "copywriter"))
         data["pin_title"] = upd.get("pin_title", data["pin_title"])
         data["pin_description"] = upd.get("pin_description", data["pin_description"])
+        return data
+
+
+class Editor:
+    """Independent QA: polishes the copy against a quality checklist using a
+    DIFFERENT provider than the Copywriter (diverse second opinion)."""
+    def review(self, data):
+        prompt = f"""You are the Editor for "Trendy Tools Hub". Quality-check and
+lightly improve this Pinterest pin. Ensure: title under 95 chars in the
+"Best X in India | spec for uses" style; description has a hook, clear CTA, and
+EXACTLY 2-4 hashtags (never more); no hype that breaks Pinterest policy; India
+spelling. Keep it natural. If it's already great, return it unchanged.
+
+Title: {data['pin_title']}
+Description: {data['pin_description']}
+
+Reply ONLY JSON: {{"pin_title":"...","pin_description":"..."}}"""
+        try:
+            upd = parse_json(get_text(prompt, "editor"))
+            if upd.get("pin_title"):
+                data["pin_title"] = upd["pin_title"]
+            if upd.get("pin_description"):
+                data["pin_description"] = upd["pin_description"]
+            print("[Editor] copy reviewed")
+        except Exception as e:
+            print(f"[warn] editor skipped: {e}")
         return data
 
 
@@ -828,6 +947,7 @@ class Manager:
         self.trend = TrendResearcher()
         self.strategist = Strategist()
         self.copywriter = Copywriter()
+        self.editor = Editor()
         self.art = ArtDirector()
         self.publisher = Publisher()
         self.analyst = Analyst()
@@ -843,6 +963,7 @@ class Manager:
         signals = self.trend.research(category)
         data = self.strategist.choose(signals, recent, category, season)
         data = self.copywriter.write(data)
+        data = self.editor.review(data)
         images, link, source = self.art.create(data)
         video = self.art.video(images)
         fmt = f"{len(images)} images" + (" + video" if video else "")
