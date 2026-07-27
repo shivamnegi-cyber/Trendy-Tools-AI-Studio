@@ -388,6 +388,78 @@ def try_web_image(keyword):
     return None
 
 
+def bestseller_link(keyword):
+    q = urllib.parse.quote_plus(keyword)
+    return (f"https://www.amazon.in/s?k={q}&s=review-rank"
+            f"&rh=p_72:1318476031&tag={AMAZON_TAG}")
+
+
+def amazon_gallery(asin):
+    """Pull the exact product's OWN gallery photos from its Amazon page, so every
+    image is the SAME real product. Returns a list of image URLs (may be empty)."""
+    try:
+        r = requests.get(f"https://www.amazon.in/dp/{asin}",
+                         headers={"User-Agent": BROWSER_UA,
+                                  "Accept-Language": "en-IN,en;q=0.9"}, timeout=30)
+        if r.status_code != 200:
+            print(f"[info] Amazon product page blocked (HTTP {r.status_code})")
+            return []
+        html = r.text
+        urls = re.findall(r'"hiRes":"(https:[^"]+?\.jpg)"', html) \
+            or re.findall(r'"large":"(https:[^"]+?\.jpg)"', html)
+        seen, out = set(), []
+        for u in urls:
+            u = u.replace("\\/", "/")
+            if u not in seen:
+                seen.add(u); out.append(u)
+        return out[:4]
+    except Exception as e:
+        print(f"[warn] amazon_gallery: {e}")
+        return []
+
+
+def amazon_images(keyword):
+    """Find the top product for the keyword and return (image_urls, product_link).
+    Prefers the product's real gallery; falls back to its search thumbnail."""
+    q = urllib.parse.quote_plus(keyword)
+    fallback_link = bestseller_link(keyword)
+    try:
+        r = requests.get(f"https://www.amazon.in/s?k={q}",
+                         headers={"User-Agent": BROWSER_UA,
+                                  "Accept-Language": "en-IN,en;q=0.9"}, timeout=30)
+        if r.status_code != 200:
+            print(f"[info] Amazon search blocked (HTTP {r.status_code})")
+            return [], fallback_link
+        html = r.text
+        asin, thumb = None, None
+        for m in re.finditer(r'data-asin="([A-Z0-9]{10})"', html):
+            window = html[m.start():m.start() + 3000]
+            for tag in re.findall(r"<img[^>]+>", window):
+                if "s-image" in tag:
+                    s = re.search(r'src="([^"]+)"', tag)
+                    if s:
+                        asin = m.group(1)
+                        thumb = re.sub(r"\._[^/]*?_\.(jpg|jpeg|png)", r".\1",
+                                       s.group(1), flags=re.I)
+                        break
+            if asin:
+                break
+        if not asin:
+            return [], fallback_link
+        link = f"https://www.amazon.in/dp/{asin}?tag={AMAZON_TAG}"
+        gallery = amazon_gallery(asin)
+        if gallery:
+            print(f"[ok] {len(gallery)} real gallery images for {asin}")
+            return gallery, link
+        if thumb:
+            print(f"[ok] 1 real thumbnail for {asin}")
+            return [thumb], link
+        return [], link
+    except Exception as e:
+        print(f"[warn] amazon_images: {e}")
+        return [], fallback_link
+
+
 def download_image(url, out="raw.jpg"):
     r = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=60)
     r.raise_for_status()
@@ -503,18 +575,20 @@ def format_pinterest(path, badge="Best Seller", out="pin_final.jpg"):
 
 
 def make_slideshow(images, out="pin_video.mp4"):
-    """Build a smooth Ken-Burns slideshow video from multiple images (ffmpeg)."""
+    """Cinematic video: each image gets a slow zoom with smooth fade in/out, then
+    they're stitched together (elegant, no hard cuts)."""
     if not images:
         return None
     try:
-        clips = []
+        clips, dur = [], 3.2
         for i, img in enumerate(images):
             c = f"clip{i}.mp4"
+            vf = (f"scale=1000:1500,zoompan=z='min(zoom+0.0010,1.09)':d=80:"
+                  f"s=1000x1500:fps=25,fade=t=in:st=0:d=0.5,"
+                  f"fade=t=out:st={dur - 0.5}:d=0.5")
             subprocess.run(
-                ["ffmpeg", "-y", "-loop", "1", "-i", img, "-t", "2.6",
-                 "-vf", ("scale=1000:1500,zoompan=z='min(zoom+0.0015,1.12)':"
-                         "d=65:s=1000x1500:fps=25"),
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25", c],
+                ["ffmpeg", "-y", "-loop", "1", "-i", img, "-t", str(dur),
+                 "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25", c],
                 check=True, capture_output=True, timeout=120)
             clips.append(c)
         with open("concat.txt", "w") as f:
@@ -523,7 +597,7 @@ def make_slideshow(images, out="pin_video.mp4"):
         subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
                         "-i", "concat.txt", "-c", "copy", out],
                        check=True, capture_output=True, timeout=120)
-        print(f"[ok] slideshow video ({len(images)} frames)")
+        print(f"[ok] cinematic video ({len(images)} scene(s))")
         return out
     except Exception as e:
         print(f"[warn] slideshow: {e}")
@@ -809,46 +883,38 @@ class ArtDirector:
 
     def create(self, data):
         kw = data["search_keyword"]
-        link = self._bestseller_link(kw)
         base = data.get("image_prompt") or data["product_name"]
-        source = "AI (professional)"
-        images = []
+        images, source = [], "AI (professional)"
 
-        # Cover: real product photo if we can get one, else a studio AI shot
-        cover = None
-        a_url, a_link = try_amazon_product(kw)
-        if a_url:
-            cover = safe_download(a_url, "raw0.jpg")
-            if cover:
-                link, source = a_link, "Amazon (real)"
-        if cover is None:
+        # 1) The exact product's OWN photos (all the SAME real item)
+        urls, link = amazon_images(kw)
+        if urls:
+            source = "Amazon (real)"
+            for i, u in enumerate(urls[:4]):
+                p = safe_download(u, f"raw{i}.jpg")
+                if p:
+                    images.append(format_pinterest(
+                        p, badge="Best Seller" if i == 0 else None, out=f"pin{i}.jpg"))
+
+        # 2) A real web photo of the product
+        if not images:
             w = try_web_image(kw)
             if w:
-                cover = safe_download(w, "raw0.jpg")
-                if cover:
+                p = safe_download(w, "raw0.jpg")
+                if p:
+                    images.append(format_pinterest(p, badge="Best Seller", out="pin0.jpg"))
                     source = "Web (real)"
-        if cover is None:
-            cover = generate_image(base + ". " + self.SCENES[0], "raw0.jpg")
-        images.append(format_pinterest(cover, badge="Best Seller", out="pin0.jpg"))
 
-        # Extra professional AI scenes (lifestyle + detail), no badge
-        for i, scene in enumerate(self.SCENES[1:], start=1):
-            try:
-                r = generate_image(base + ". " + scene, f"raw{i}.jpg")
-                images.append(format_pinterest(r, badge=None, out=f"pin{i}.jpg"))
-            except Exception as e:
-                print(f"[warn] scene {i} failed: {e}")
-        print(f"[ArtDirector] {len(images)} images ready ({source})")
+        # 3) ONE consistent AI image (no mismatched variants)
+        if not images:
+            p = generate_image(base + ". " + self.SCENES[0], "raw0.jpg")
+            images.append(format_pinterest(p, badge="Best Seller", out="pin0.jpg"))
+
+        print(f"[ArtDirector] {len(images)} image(s) ready ({source})")
         return images, link, source
 
     def video(self, images):
         return make_slideshow(images)
-
-    @staticmethod
-    def _bestseller_link(keyword):
-        q = urllib.parse.quote_plus(keyword)
-        return (f"https://www.amazon.in/s?k={q}&s=review-rank"
-                f"&rh=p_72:1318476031&tag={AMAZON_TAG}")
 
 
 class Publisher:
@@ -929,24 +995,24 @@ class Publisher:
                                     "Pinterest write access is live - then it auto-posts.")
             except Exception as e:
                 tg_send_message(f"⚠️ Pinterest post failed ({e}).")
-        logged = self._log(ws, data, link, posted_to, source, fmt, status)
-        tg_send_message("🗒️ Logged to your Google Sheet."
-                        if logged else
-                        "⚠️ Couldn't write to the sheet - make sure it's a native "
-                        "Google Sheet (File → Save as Google Sheets), not an Excel file.")
+        logged, err = self._log(ws, data, link, posted_to, source, fmt, status)
+        tg_send_message("🗒️ Logged to your Google Sheet." if logged
+                        else f"⚠️ Sheet log failed: {err[:250]}")
 
     @staticmethod
     def _log(ws, *args):
+        err = ""
         for attempt in range(2):
             try:
                 if ws is None:
                     ws = get_worksheet()
                 log_post(ws, *args)
-                return True
+                return True, ""
             except Exception as e:
+                err = str(e)
                 print(f"[warn] sheet log attempt {attempt + 1}: {e}")
                 ws = None
-        return False
+        return False, err
 
 
 class Analyst:
